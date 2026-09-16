@@ -1,317 +1,721 @@
-/*
- * simulador_bbr.c
- * Simulador didactico de BBR (modelo simplificado inspirado en BBRv1).
+/* ============================================================================
+ *  bbr_sim.c  --  Simulador interactivo del control de congestion BBR (v1)
  *
- * Compilar:
- *   gcc simulador_bbr.c -o simulador_bbr -lm
+ *  Compilar:  gcc -O2 -o bbr_sim bbr_sim.c -lm
+ *  Ejecutar :  ./bbr_sim
+ *              ./bbr_sim --bw 50 --rtt 30 --buf 200 --loss 0.1
+ *              ./bbr_sim --batch --dur 60 --csv salida.csv
  *
- * Ejecutar:
- *   ./simulador_bbr
- *
- * Genera:
- *   bbr_datos.csv
- *
- * Para graficar los resultados se puede abrir el CSV en Excel/LibreOffice.
- * Tambien se puede usar gnuplot:
- *   plot "bbr_datos.csv" using 1:2 with lines title "BtlBw"
- *   plot "bbr_datos.csv" using 1:3 with lines title "RTprop"
- */
+ *  Modelo:
+ *    - Enlace cuello de botella con modelo fluido (reloj virtual de servicio),
+ *      cola FIFO con drop-tail y perdida aleatoria opcional.
+ *    - Emisor BBR: filtro maximo de BtlBw (10 rondas), filtro minimo de
+ *      RTprop (10 s), maquina de estados STARTUP / DRAIN / PROBE_BW / PROBE_RTT.
+ *    - Paso de simulacion: 0.25 ms.
+ * ==========================================================================*/
 
+#define _POSIX_C_SOURCE 200809L
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdarg.h>
 #include <string.h>
 #include <math.h>
+#include <time.h>
+#include <unistd.h>
+#include <termios.h>
+#include <signal.h>
 
-#define MAX_MUESTRAS 1000
+/* --------------------------------------------------------------- constantes */
+#define MSS        1500.0      /* bytes por paquete                          */
+#define TICK       0.25        /* ms por paso de simulacion                  */
+#define SPMS       4           /* slots por ms en el anillo de ACKs          */
+#define RING       16384       /* horizonte del anillo: RING/SPMS = 4096 ms  */
+#define BWWND      10          /* rondas del filtro maximo de BtlBw          */
+#define RTWND      100         /* cubetas de 100 ms -> 10 s de RTprop        */
+#define RENDER_MS  40.0        /* ms de simulacion por cuadro dibujado       */
+#define W_PLOT     72          /* columnas de cada grafica                   */
+#define H_PLOT     6           /* filas de cada grafica                      */
+#define HIGH_GAIN  2.885       /* 2/ln(2): ganancia de STARTUP               */
+#define PROBE_RTT_MS  200.0
+#define RTPROP_EXPIRY 10000.0  /* ms                                         */
 
-typedef enum {
-    STARTUP,
-    DRAIN,
-    PROBE_BW,
-    PROBE_RTT
-} Fase;
+/* bytes/ms  <->  Mbps :  1 Mbps = 125 bytes/ms */
+#define MBPS2BPMS(x) ((x) * 125.0)
+#define BPMS2MBPS(x) ((x) / 125.0)
+
+static double dmax(double a, double b) { return a > b ? a : b; }
+static double dmin(double a, double b) { return a < b ? a : b; }
+
+/* ------------------------------------------------------------------ estados */
+typedef enum { ST_STARTUP = 0, ST_DRAIN, ST_PROBE_BW, ST_PROBE_RTT } State;
+static const char *ST_NAME[]  = { "STARTUP", "DRAIN", "PROBE_BW", "PROBE_RTT" };
+static const char *ST_COLOR[] = { "\033[1;93m", "\033[1;95m", "\033[1;92m", "\033[1;96m" };
+static const double PGAIN[8]  = { 1.25, 0.75, 1, 1, 1, 1, 1, 1 };
+
+/* --------------------------------------------------------------- estructuras */
+typedef struct {                /* parametros de la red (editables en vivo) */
+    double bw_mbps;             /* ancho de banda del cuello de botella      */
+    double rtprop_ms;           /* retardo de propagacion ida y vuelta       */
+    double buffer_pkts;         /* capacidad de la cola                      */
+    double loss_pct;            /* perdida aleatoria (%)                     */
+} Link;
 
 typedef struct {
-    double tiempo;
-    double btlbw_mbps;
-    double rtprop_ms;
-    double rtt_ms;
-    double tasa_mbps;
-    double cwnd_bytes;
-    Fase fase;
-} Muestra;
+    double  t;                  /* tiempo de simulacion (ms)                 */
+    Link    link;
 
-const char *nombre_fase(Fase f) {
-    switch (f) {
-        case STARTUP:   return "STARTUP";
-        case DRAIN:     return "DRAIN";
-        case PROBE_BW:  return "PROBE_BW";
-        case PROBE_RTT: return "PROBE_RTT";
-        default:        return "DESCONOCIDA";
-    }
+    /* ---- cuello de botella ---- */
+    double  svc_end;            /* instante en que la cola queda vacia       */
+    double  ack_bytes[RING];    /* bytes que se entregan (ACK) en cada slot  */
+    double  ack_rttw[RING];     /* suma bytes*rtt para promediar la muestra  */
+    double  rtx_bytes[RING];    /* bytes perdidos que liberan inflight       */
+
+    /* ---- emisor ---- */
+    double  inflight, cwnd, pacing, bucket;
+    double  delivered, next_round_delivered;
+    long    rounds;
+
+    /* ---- estimadores BBR ---- */
+    State   st;
+    double  bw_wnd[BWWND]; int bw_idx;
+    double  rt_wnd[RTWND]; int rt_idx; double rt_bucket_t;
+    double  btlbw;              /* bytes/ms                                  */
+    double  rtprop;             /* ms                                        */
+    double  full_bw; int full_bw_cnt, full_bw_reached;
+    int     cycle_idx; double cycle_t;
+    double  rtprop_stamp, probe_rtt_start, prior_cwnd;
+    double  pacing_gain, cwnd_gain;
+
+    /* ---- metricas / contadores ---- */
+    double  rate_sample;        /* tasa de entrega suavizada (bytes/ms)      */
+    double  rtt_cur;
+    double  qdelay, qbytes;
+    double  sent_bytes, delivered_bytes, lost_bytes;
+    long    drops_buf, drops_rand;
+} Sim;
+
+/* ------------------------------------------------------------- historial UI */
+typedef struct {
+    double rate[W_PLOT], btlbw[W_PLOT], pacing[W_PLOT];
+    double rtt[W_PLOT],  rtprop[W_PLOT];
+    double inflight[W_PLOT], bdp[W_PLOT], cwnd[W_PLOT];
+    double qdelay[W_PLOT];
+    double phase[W_PLOT];
+} Hist;
+
+static void push(double *a, double v)
+{
+    memmove(a, a + 1, (W_PLOT - 1) * sizeof(double));
+    a[W_PLOT - 1] = v;
 }
 
-double min(double a, double b) { return a < b ? a : b; }
-double max(double a, double b) { return a > b ? a : b; }
+/* =========================================================================
+ *  MODELO DEL ENLACE
+ * =======================================================================*/
+static int slot_of(double t)
+{
+    long i = (long)llround(t * SPMS);
+    return (int)(((i % RING) + RING) % RING);
+}
 
-int main(void) {
-    double capacidad_mbps, rt_base_ms, perdida, mss;
-    int duracion, intervalo_ms;
+/* Encola un paquete en el cuello de botella y programa su ACK. */
+static void enqueue_pkt(Sim *s)
+{
+    double rate   = MBPS2BPMS(s->link.bw_mbps);         /* bytes/ms */
+    double serv   = MSS / rate;                          /* ms de servicio   */
+    double maxq   = (s->link.buffer_pkts * MSS) / rate;  /* ms de cola max   */
 
-    printf("=========================================\n");
-    printf("       SIMULADOR DIDACTICO DE BBR\n");
-    printf("=========================================\n\n");
+    if (s->svc_end < s->t) s->svc_end = s->t;
+    double qd = s->svc_end - s->t;
 
-    printf("Ancho de banda del enlace (Mbps) [1-100]: ");
-    scanf("%lf", &capacidad_mbps);
+    s->sent_bytes += MSS;
 
-    printf("RTT/base de propagacion (ms) [1-500]: ");
-    scanf("%lf", &rt_base_ms);
+    if (qd + serv > maxq + 1e-9) {          /* cola llena -> drop tail       */
+        s->drops_buf++; s->lost_bytes += MSS;
+        s->rtx_bytes[slot_of(s->t + s->link.rtprop_ms * 2 + qd)] += MSS;
+        return;
+    }
 
-    printf("Perdida de paquetes (%%) [0-20]: ");
-    scanf("%lf", &perdida);
+    s->svc_end += serv;                      /* ocupa el enlace              */
 
-    printf("MSS en bytes [500-9000]: ");
-    scanf("%lf", &mss);
+    int perdido = (s->link.loss_pct > 0.0) &&
+                  ((double)rand() / (double)RAND_MAX < s->link.loss_pct / 100.0);
+    if (perdido) {
+        s->drops_rand++; s->lost_bytes += MSS;
+        s->rtx_bytes[slot_of(s->svc_end + s->link.rtprop_ms * 2)] += MSS;
+        return;
+    }
 
-    printf("Duracion de simulacion (segundos) [10-60]: ");
-    scanf("%d", &duracion);
+    double ack_t = s->svc_end + s->link.rtprop_ms;   /* RTT = cola + propag. */
+    double rtt   = ack_t - s->t;
+    if (rtt > (RING / SPMS) - 20.0) {                /* fuera de horizonte   */
+        s->drops_buf++; s->lost_bytes += MSS;
+        s->rtx_bytes[slot_of(s->t + (RING / SPMS) - 25.0)] += MSS;
+        return;
+    }
+    int k = slot_of(ack_t);
+    s->ack_bytes[k] += MSS;
+    s->ack_rttw[k]  += MSS * rtt;
+}
 
-    printf("Intervalo de muestreo (ms) [100-1000]: ");
-    scanf("%d", &intervalo_ms);
+/* =========================================================================
+ *  BBR
+ * =======================================================================*/
+static double bw_filter_max(Sim *s)
+{
+    double m = 0; for (int i = 0; i < BWWND; i++) if (s->bw_wnd[i] > m) m = s->bw_wnd[i];
+    return m;
+}
+static double rt_filter_min(Sim *s)
+{
+    double m = 1e18; for (int i = 0; i < RTWND; i++) if (s->rt_wnd[i] < m) m = s->rt_wnd[i];
+    return m;
+}
 
-    if (capacidad_mbps < 1) capacidad_mbps = 1;
-    if (capacidad_mbps > 100) capacidad_mbps = 100;
-    if (rt_base_ms < 1) rt_base_ms = 1;
-    if (rt_base_ms > 500) rt_base_ms = 500;
-    if (perdida < 0) perdida = 0;
-    if (perdida > 20) perdida = 20;
-    if (mss < 500) mss = 500;
-    if (mss > 9000) mss = 9000;
-    if (duracion < 10) duracion = 10;
-    if (duracion > 60) duracion = 60;
-    if (intervalo_ms < 100) intervalo_ms = 100;
-    if (intervalo_ms > 1000) intervalo_ms = 1000;
+static void bbr_set_controls(Sim *s)
+{
+    double bdp = s->btlbw * s->rtprop;              /* bytes                 */
 
-    Muestra muestras[MAX_MUESTRAS];
-    int n = 0;
+    switch (s->st) {
+    case ST_STARTUP:   s->pacing_gain = HIGH_GAIN;      s->cwnd_gain = HIGH_GAIN; break;
+    case ST_DRAIN:     s->pacing_gain = 1.0 / HIGH_GAIN;s->cwnd_gain = HIGH_GAIN; break;
+    case ST_PROBE_BW:  s->pacing_gain = PGAIN[s->cycle_idx]; s->cwnd_gain = 2.0;  break;
+    case ST_PROBE_RTT: s->pacing_gain = 1.0;            s->cwnd_gain = 1.0;       break;
+    }
 
-    double btlbw = capacidad_mbps * 0.10;
-    double rtprop = rt_base_ms * 1.20;
-    double pacing_gain = 2.89;
-    Fase fase = STARTUP;
+    if (s->st == ST_PROBE_RTT)
+        s->cwnd = 4 * MSS;
+    else
+        s->cwnd = dmax(s->cwnd_gain * bdp, 4 * MSS);
 
-    int pasos = (duracion * 1000) / intervalo_ms;
-    if (pasos > MAX_MUESTRAS) pasos = MAX_MUESTRAS;
+    s->pacing = dmax(s->pacing_gain * s->btlbw, MSS / 100.0);
+}
 
-    double tiempo_fase = 0.0;
-    int ciclo_probe = 0;
-    double acumulado_rtt = rt_base_ms * 0.20;
+static void bbr_on_ack(Sim *s, double rtt, int new_round)
+{
+    /* ---- filtro minimo de RTprop (ventana de 10 s en cubetas de 100 ms) -- */
+    if (s->t - s->rt_bucket_t >= 100.0) {
+        s->rt_idx = (s->rt_idx + 1) % RTWND;
+        s->rt_wnd[s->rt_idx] = 1e18;
+        s->rt_bucket_t = s->t;
+    }
+    if (rtt <= s->rtprop + 1e-9) s->rtprop_stamp = s->t;  /* muestra <= min  */
+    if (rtt < s->rt_wnd[s->rt_idx]) s->rt_wnd[s->rt_idx] = rtt;
+    s->rtprop = rt_filter_min(s);
 
-    printf("\nSimulando...\n\n");
+    /* ---- filtro maximo de BtlBw (ventana de 10 rondas) ------------------ */
+    if (new_round) {
+        s->rounds++;
+        s->bw_idx = (s->bw_idx + 1) % BWWND;
+        s->bw_wnd[s->bw_idx] = 0;
+    }
+    if (s->rate_sample > s->bw_wnd[s->bw_idx]) s->bw_wnd[s->bw_idx] = s->rate_sample;
+    s->btlbw = bw_filter_max(s);
 
-    for (int i = 0; i < pasos; i++) {
-        double t = (i * intervalo_ms) / 1000.0;
+    double bdp = s->btlbw * s->rtprop;
 
-        /*
-         * Modelo de red didactico:
-         * - STARTUP descubre progresivamente el BtlBw.
-         * - DRAIN reduce la tasa para vaciar la cola.
-         * - PROBE_BW utiliza el ciclo 1.25/0.75/1...
-         * - PROBE_RTT reduce temporalmente el in-flight y actualiza RTprop.
-         */
+    /* ---- maquina de estados -------------------------------------------- */
+    if (s->st == ST_STARTUP && new_round) {
+        if (s->btlbw >= s->full_bw * 1.25) { s->full_bw = s->btlbw; s->full_bw_cnt = 0; }
+        else if (++s->full_bw_cnt >= 3) {
+            s->full_bw_reached = 1;
+            s->st = ST_DRAIN;                 /* vaciar la cola creada        */
+        }
+    }
+    if (s->st == ST_DRAIN && s->inflight <= bdp) {
+        s->st = ST_PROBE_BW; s->cycle_idx = 2; s->cycle_t = s->t;
+    }
+    if (s->st == ST_PROBE_BW) {
+        double fase = dmax(s->rtprop, 1.0);
+        double transcurrido = s->t - s->cycle_t;
+        double g = PGAIN[s->cycle_idx];
+        int avanzar;
+        if (g > 1.0)                       /* sondeo: sube hasta 1.25*BDP    */
+            avanzar = (transcurrido >= fase) &&
+                      (s->inflight >= 1.25 * bdp || transcurrido >= 2 * fase);
+        else if (g < 1.0)                  /* drenaje: baja hasta el BDP     */
+            avanzar = (transcurrido >= fase) &&
+                      (s->inflight <= bdp || transcurrido >= 4 * fase);
+        else                               /* crucero: una ronda             */
+            avanzar = (transcurrido >= fase);
 
-        if (fase == STARTUP) {
-            pacing_gain = 2.89;
+        if (avanzar) { s->cycle_idx = (s->cycle_idx + 1) % 8; s->cycle_t = s->t; }
+    }
 
-            /* crecimiento exponencial limitado por la capacidad */
-            btlbw = min(capacidad_mbps,
-                        btlbw * 1.35);
+    /* ---- PROBE_RTT: reconfirmar RTprop cada 10 s ------------------------ */
+    if (s->st != ST_PROBE_RTT && s->t - s->rtprop_stamp > RTPROP_EXPIRY) {
+        s->prior_cwnd = s->cwnd;
+        s->st = ST_PROBE_RTT;
+        s->probe_rtt_start = -1;
+    }
+    if (s->st == ST_PROBE_RTT) {
+        if (s->probe_rtt_start < 0 && s->inflight <= 4 * MSS + 1.0)
+            s->probe_rtt_start = s->t;
+        if (s->probe_rtt_start > 0 && s->t - s->probe_rtt_start >= PROBE_RTT_MS) {
+            s->rtprop_stamp = s->t;
+            s->st = s->full_bw_reached ? ST_PROBE_BW : ST_STARTUP;
+            s->cycle_idx = 2; s->cycle_t = s->t;
+        }
+    }
 
-            acumulado_rtt += (btlbw / capacidad_mbps) * 0.4;
+    bbr_set_controls(s);
+}
 
-            if (btlbw >= capacidad_mbps * 0.90 || tiempo_fase >= 4.0) {
-                fase = DRAIN;
-                tiempo_fase = 0.0;
+/* =========================================================================
+ *  UN PASO DE SIMULACION (TICK ms)
+ * =======================================================================*/
+static void sim_step(Sim *s)
+{
+    int k = slot_of(s->t);
+
+    /* 1) retransmisiones: liberan inflight sin contar como entregadas ----- */
+    if (s->rtx_bytes[k] > 0) {
+        s->inflight = dmax(0, s->inflight - s->rtx_bytes[k]);
+        s->rtx_bytes[k] = 0;
+    }
+
+    /* 2) ACKs que llegan en este slot ------------------------------------- */
+    double acked = s->ack_bytes[k];
+    double inst  = acked / TICK;                 /* bytes/ms instantaneo     */
+    double tau   = 8.0;                          /* suavizado de la muestra  */
+    s->rate_sample += (inst - s->rate_sample) * (TICK / tau);
+
+    if (acked > 0) {
+        double rtt = s->ack_rttw[k] / acked;
+        s->ack_bytes[k] = 0; s->ack_rttw[k] = 0;
+
+        s->inflight  = dmax(0, s->inflight - acked);
+        s->delivered += acked;
+        s->delivered_bytes += acked;
+        s->rtt_cur = rtt;
+
+        int new_round = 0;
+        if (s->delivered >= s->next_round_delivered) {
+            s->next_round_delivered = s->delivered + s->inflight;
+            new_round = 1;
+        }
+        bbr_on_ack(s, rtt, new_round);
+    }
+
+    /* 3) envio limitado por pacing y por cwnd ------------------------------ */
+    s->bucket += s->pacing * TICK;
+    if (s->bucket > 10 * MSS) s->bucket = 10 * MSS;      /* anti-rafaga      */
+    double room = s->cwnd - s->inflight;
+    double can  = dmin(s->bucket, room);
+    int npkts   = (can > 0) ? (int)floor(can / MSS) : 0;
+    for (int i = 0; i < npkts; i++) {
+        s->bucket   -= MSS;
+        s->inflight += MSS;
+        enqueue_pkt(s);
+    }
+
+    /* 4) estado de la cola ------------------------------------------------ */
+    double rate = MBPS2BPMS(s->link.bw_mbps);
+    s->qdelay = dmax(0, s->svc_end - s->t);
+    s->qbytes = s->qdelay * rate;
+
+    s->t += TICK;
+}
+
+/* =========================================================================
+ *  INICIALIZACION
+ * =======================================================================*/
+static void sim_reset(Sim *s, Link l)
+{
+    memset(s, 0, sizeof(*s));
+    s->link = l;
+    s->t = 0;
+    s->svc_end = 0;
+    s->rtprop = l.rtprop_ms;              /* estimacion inicial (handshake)  */
+    s->rtprop_stamp = 0;
+    s->rt_bucket_t = 0;
+    for (int i = 0; i < RTWND; i++) s->rt_wnd[i] = 1e18;
+    s->rt_wnd[0] = l.rtprop_ms;
+    s->btlbw = (10 * MSS) / s->rtprop;    /* IW10 / RTT inicial              */
+    s->bw_wnd[0] = s->btlbw;
+    s->full_bw = s->btlbw;
+    s->st = ST_STARTUP;
+    s->cwnd = 10 * MSS;
+    s->pacing = HIGH_GAIN * s->btlbw;
+    s->pacing_gain = HIGH_GAIN; s->cwnd_gain = HIGH_GAIN;
+    s->rate_sample = 0;
+    s->rtt_cur = l.rtprop_ms;
+    s->next_round_delivered = 0;
+}
+
+/* Cambia el ancho de banda conservando los bytes ya encolados. */
+static void set_bw(Sim *s, double mbps)
+{
+    if (mbps < 0.1) mbps = 0.1;
+    if (mbps > 10000) mbps = 10000;
+    double old = MBPS2BPMS(s->link.bw_mbps);
+    double qb  = dmax(0, s->svc_end - s->t) * old;
+    s->link.bw_mbps = mbps;
+    s->svc_end = s->t + qb / MBPS2BPMS(mbps);
+}
+static void set_rtt(Sim *s, double ms)
+{
+    if (ms < 1) ms = 1;
+    if (ms > 2000) ms = 2000;
+    s->link.rtprop_ms = ms;
+}
+
+/* =========================================================================
+ *  RENDER: buffer de cuadro + graficas ANSI
+ * =======================================================================*/
+static char FB[262144]; static int fbn;
+static void ap(const char *fmt, ...)
+{
+    if (fbn >= (int)sizeof(FB) - 512) return;
+    va_list a; va_start(a, fmt);
+    fbn += vsnprintf(FB + fbn, sizeof(FB) - fbn, fmt, a);
+    va_end(a);
+}
+
+typedef struct { double *h; const char *color; const char *name; const char *glyph; } Serie;
+
+static void panel(const char *titulo, const char *unidad, Serie *S, int ns)
+{
+    double vmax = 0, vmin = 0;
+    for (int i = 0; i < ns; i++)
+        for (int c = 0; c < W_PLOT; c++)
+            if (S[i].h[c] > vmax) vmax = S[i].h[c];
+    if (vmax <= 0) vmax = 1;
+    vmax *= 1.15;
+
+    int owner[H_PLOT][W_PLOT];
+    for (int r = 0; r < H_PLOT; r++) for (int c = 0; c < W_PLOT; c++) owner[r][c] = -1;
+
+    for (int i = ns - 1; i >= 0; i--) {                 /* serie 0 al frente */
+        for (int c = 0; c < W_PLOT; c++) {
+            double v = S[i].h[c];
+            if (v < vmin) v = vmin;
+            if (v > vmax) v = vmax;
+            int r = (int)lround((1.0 - (v - vmin) / (vmax - vmin)) * (H_PLOT - 1));
+            if (r < 0) r = 0;
+            if (r >= H_PLOT) r = H_PLOT - 1;
+            owner[r][c] = i;
+        }
+    }
+
+    ap("\033[1m%s\033[0m \033[2m[%s]\033[0m  ", titulo, unidad);
+    for (int i = 0; i < ns; i++)
+        ap("%s%s\033[0m %s%s  ", S[i].color, S[i].glyph, S[i].name,
+           i == ns - 1 ? "" : " ");
+    ap("\033[K\n");
+
+    for (int r = 0; r < H_PLOT; r++) {
+        if (r == 0)               ap("%8.1f \u2524", vmax);
+        else if (r == H_PLOT - 1) ap("%8.1f \u2524", vmin);
+        else                      ap("%8s \u2502", "");
+        for (int c = 0; c < W_PLOT; c++) {
+            int o = owner[r][c];
+            if (o < 0) ap(" ");
+            else ap("%s%s\033[0m", S[o].color, S[o].glyph);
+        }
+        ap("\033[K\n");
+    }
+    ap("%8s \u2514", "");
+    for (int c = 0; c < W_PLOT; c++) ap("\u2500");
+    ap("\033[K\n");
+}
+
+/* Barra de fases BBR en el tiempo */
+static void phase_bar(Hist *h)
+{
+    ap("\033[1mFase BBR\033[0m \033[2m[historial]\033[0m  ");
+    for (int i = 0; i < 4; i++) ap("%s\u2588 %s\033[0m ", ST_COLOR[i], ST_NAME[i]);
+    ap("\033[K\n%8s \u2502", "");
+    for (int c = 0; c < W_PLOT; c++) {
+        int p = (int)h->phase[c];
+        if (p < 0 || p > 3) { ap(" "); continue; }
+        ap("%s\u2588\033[0m", ST_COLOR[p]);
+    }
+    ap("\033[K\n");
+}
+
+static void render(Sim *s, Hist *h, int paused, double speed, int help)
+{
+    fbn = 0;
+    ap("\033[H");
+
+    double bdp = s->btlbw * s->rtprop;
+    double ventana_ms = W_PLOT * RENDER_MS;
+
+    ap("\033[1;97m  SIMULADOR BBR\033[0m  t=\033[1m%7.2f s\033[0m  "
+       "vel=\033[1m%.2fx\033[0m %s\033[K\n",
+       s->t / 1000.0, speed, paused ? "\033[1;91m[PAUSA]\033[0m" : "        ");
+
+    ap("\033[2m  RED  \033[0m BtlBw real \033[1m%7.2f Mbps\033[0m   "
+       "RTprop real \033[1m%6.1f ms\033[0m   buffer \033[1m%5.0f pkt\033[0m   "
+       "perdida \033[1m%.2f%%\033[0m\033[K\n",
+       s->link.bw_mbps, s->link.rtprop_ms, s->link.buffer_pkts, s->link.loss_pct);
+
+    ap("\033[2m  BBR  \033[0m fase %s%-9s\033[0m  pacing_gain \033[1m%4.2f\033[0m  "
+       "cwnd_gain \033[1m%4.2f\033[0m  rondas \033[1m%ld\033[0m\033[K\n",
+       ST_COLOR[s->st], ST_NAME[s->st], s->pacing_gain, s->cwnd_gain, s->rounds);
+
+    ap("\033[2m  EST. \033[0m BtlBw \033[1;93m%7.2f Mbps\033[0m  "
+       "RTprop \033[1;94m%6.1f ms\033[0m  BDP \033[1;97m%7.1f KB\033[0m (%.0f pkt)\033[K\n",
+       BPMS2MBPS(s->btlbw), s->rtprop, bdp / 1024.0, bdp / MSS);
+
+    ap("\033[2m  AHORA\033[0m Tasa tx \033[1;96m%7.2f Mbps\033[0m  "
+       "RTT \033[1;92m%6.1f ms\033[0m  cola \033[1;91m%5.1f ms\033[0m (%.0f pkt)  "
+       "inflight \033[1m%6.1f KB\033[0m\033[K\n",
+       BPMS2MBPS(s->rate_sample), s->rtt_cur, s->qdelay, s->qbytes / MSS,
+       s->inflight / 1024.0);
+
+    double util = (s->t > 0) ? BPMS2MBPS(s->delivered_bytes / s->t) : 0;
+    ap("\033[2m  TOTAL\033[0m entregado \033[1m%8.2f MB\033[0m  media \033[1m%6.2f Mbps\033[0m  "
+       "perdidas \033[1;91m%ld\033[0m (cola %ld / azar %ld)\033[K\n",
+       s->delivered_bytes / 1e6, util, s->drops_buf + s->drops_rand,
+       s->drops_buf, s->drops_rand);
+
+    ap("\033[K\n");
+
+    Serie s1[3] = {
+        { h->rate,   "\033[96m", "tasa entregada", "\u25cf" },
+        { h->btlbw,  "\033[93m", "BtlBw (max 10 rondas)", "\u2500" },
+        { h->pacing, "\033[90m", "pacing rate", "\u00b7" },
+    };
+    panel("1. TASA DE TRANSMISION", "Mbps", s1, 3);
+
+    Serie s2[2] = {
+        { h->rtt,    "\033[92m", "RTT medido", "\u25cf" },
+        { h->rtprop, "\033[94m", "RTprop (min 10 s)", "\u2500" },
+    };
+    panel("2. RTT", "ms", s2, 2);
+
+    Serie s3[3] = {
+        { h->inflight, "\033[95m", "inflight", "\u25cf" },
+        { h->bdp,      "\033[97m", "BDP = BtlBw x RTprop", "\u2500" },
+        { h->cwnd,     "\033[90m", "cwnd", "\u00b7" },
+    };
+    panel("3. BDP vs DATOS EN VUELO", "KB", s3, 3);
+
+    Serie s4[1] = {
+        { h->qdelay, "\033[91m", "delay de encolamiento (RTT - RTprop)", "\u25cf" },
+    };
+    panel("4. DELAY EN COLA", "ms", s4, 1);
+
+    phase_bar(h);
+    ap("%8s \033[2mventana visible: ultimos %.1f s\033[0m\033[K\n", "", ventana_ms / 1000.0);
+
+    if (help) {
+        ap("\033[K\n\033[1m TECLAS \033[0m\033[K\n");
+        ap("  \033[1mb/B\033[0m  ancho de banda  -/+ 10%%      \033[1mr/R\033[0m  RTprop -/+ 5 ms\033[K\n");
+        ap("  \033[1mw/W\033[0m  buffer -/+ 20%%              \033[1mf/F\033[0m  perdida -/+ 0.1%%\033[K\n");
+        ap("  \033[1m1..4\033[0m perfiles: LAN / WiFi / 4G / Satelite\033[K\n");
+        ap("  \033[1mp\033[0m paus  \033[1mn\033[0m paso  \033[1mz\033[0m reiniciar  "
+           "\033[1m+/-\033[0m velocidad  \033[1mh\033[0m ayuda  \033[1mq\033[0m salir\033[K\n");
+    } else {
+        ap("%6s \033[2m[h]ayuda [b/B]BW [r/R]RTT [w/W]buffer [f/F]perdida "
+           "[p]pausa [q]salir\033[0m\033[K\n", "");
+    }
+    ap("\033[J");
+    fwrite(FB, 1, fbn, stdout);
+    fflush(stdout);
+}
+
+/* =========================================================================
+ *  TERMINAL
+ * =======================================================================*/
+static struct termios g_old;
+static int g_raw = 0, g_run = 1;
+
+static void term_restore(void)
+{
+    if (g_raw) { tcsetattr(STDIN_FILENO, TCSANOW, &g_old); g_raw = 0; }
+    printf("\033[?25h\033[0m\n");
+    fflush(stdout);
+}
+static void on_sig(int x) { (void)x; g_run = 0; }
+
+static void term_raw(void)
+{
+    struct termios t;
+    if (tcgetattr(STDIN_FILENO, &g_old) < 0) return;
+    t = g_old;
+    t.c_lflag &= ~(ICANON | ECHO);
+    t.c_cc[VMIN] = 0; t.c_cc[VTIME] = 0;
+    tcsetattr(STDIN_FILENO, TCSANOW, &t);
+    g_raw = 1;
+    atexit(term_restore);
+    printf("\033[?25l\033[2J");
+}
+
+/* =========================================================================
+ *  PERFILES DE RED
+ * =======================================================================*/
+static Link preset(int i)
+{
+    Link l;
+    switch (i) {
+    case 1: l = (Link){ 1000.0,  1.0, 400, 0.0  }; break;  /* LAN            */
+    case 2: l = (Link){   80.0, 12.0, 150, 0.2  }; break;  /* WiFi           */
+    case 3: l = (Link){   25.0, 45.0, 600, 0.5  }; break;  /* 4G bufferbloat */
+    case 4: l = (Link){   10.0, 600.0, 200, 1.0 }; break;  /* satelital      */
+    default:l = (Link){   20.0, 40.0, 150, 0.0  }; break;
+    }
+    return l;
+}
+
+/* =========================================================================
+ *  MAIN
+ * =======================================================================*/
+static void usage(void)
+{
+    printf(
+      "Uso: bbr_sim [opciones]\n"
+      "  --bw   <Mbps>   ancho de banda del cuello de botella (def 20)\n"
+      "  --rtt  <ms>     retardo de propagacion RTprop        (def 40)\n"
+      "  --buf  <pkts>   tamano del buffer                    (def 150)\n"
+      "  --loss <%%>      perdida aleatoria                    (def 0)\n"
+      "  --dur  <s>      duracion en modo batch                (def 60)\n"
+      "  --csv  <arch>   volcar la traza a CSV (gnuplot/Excel)\n"
+      "  --batch         sin interfaz: escenario guionado + CSV\n"
+      "  -h --help       esta ayuda\n");
+}
+
+int main(int argc, char **argv)
+{
+    Link l = preset(0);
+    double dur = 60.0;
+    const char *csvpath = NULL;
+    int batch = 0;
+
+    for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "--bw")   && i + 1 < argc) l.bw_mbps     = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--rtt")  && i + 1 < argc) l.rtprop_ms  = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--buf")  && i + 1 < argc) l.buffer_pkts= atof(argv[++i]);
+        else if (!strcmp(argv[i], "--loss") && i + 1 < argc) l.loss_pct   = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--dur")  && i + 1 < argc) dur         = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--csv")  && i + 1 < argc) csvpath     = argv[++i];
+        else if (!strcmp(argv[i], "--batch")) batch = 1;
+        else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) { usage(); return 0; }
+        else { fprintf(stderr, "Opcion desconocida: %s\n", argv[i]); usage(); return 1; }
+    }
+    if (l.rtprop_ms < 1) l.rtprop_ms = 1;
+    srand(12345);
+
+    static Sim s; static Hist h;
+    sim_reset(&s, l);
+    memset(&h, 0, sizeof(h));
+    for (int c = 0; c < W_PLOT; c++) h.phase[c] = -1;
+
+    FILE *csv = NULL;
+    if (csvpath) {
+        csv = fopen(csvpath, "w");
+        if (csv) fprintf(csv, "t_s,fase,bw_real_mbps,rtprop_real_ms,tasa_mbps,btlbw_mbps,"
+                              "rtt_ms,rtprop_ms,bdp_kb,inflight_kb,cwnd_kb,qdelay_ms,"
+                              "pacing_gain,perdidas\n");
+    }
+
+    int interactive = !batch && isatty(STDIN_FILENO) && isatty(STDOUT_FILENO);
+    int paused = 0, help = 0;
+    double speed = 1.0;
+    int steps_per_frame = (int)(RENDER_MS / TICK);
+
+    if (interactive) { term_raw(); signal(SIGINT, on_sig); signal(SIGTERM, on_sig); }
+    else if (!batch) fprintf(stderr, "[aviso] sin TTY: ejecutando en modo batch\n");
+
+    double next_frame = 0;
+    struct timespec t0; clock_gettime(CLOCK_MONOTONIC, &t0);
+
+    while (g_run) {
+        /* ------------------------------------------------ entrada teclado */
+        if (interactive) {
+            char c;
+            while (read(STDIN_FILENO, &c, 1) == 1) {
+                switch (c) {
+                case 'b': set_bw(&s, s.link.bw_mbps * 0.9); break;
+                case 'B': set_bw(&s, s.link.bw_mbps * 1.1); break;
+                case 'r': set_rtt(&s, s.link.rtprop_ms - 5); break;
+                case 'R': set_rtt(&s, s.link.rtprop_ms + 5); break;
+                case 'w': s.link.buffer_pkts = dmax(4, s.link.buffer_pkts * 0.8); break;
+                case 'W': s.link.buffer_pkts = dmin(100000, s.link.buffer_pkts * 1.25); break;
+                case 'f': s.link.loss_pct = dmax(0, s.link.loss_pct - 0.1); break;
+                case 'F': s.link.loss_pct = dmin(50, s.link.loss_pct + 0.1); break;
+                case '1': case '2': case '3': case '4': {
+                    Link nl = preset(c - '0');
+                    double t = s.t; s.link = nl; set_bw(&s, nl.bw_mbps); s.t = t;
+                    break; }
+                case 'p': paused = !paused; break;
+                case 'n': for (int i = 0; i < steps_per_frame; i++) sim_step(&s); break;
+                case 'z': {
+                    Link cur = s.link;
+                    sim_reset(&s, cur);
+                    memset(&h, 0, sizeof(h));
+                    for (int k = 0; k < W_PLOT; k++) h.phase[k] = -1;
+                    break;
+                }
+                case '+': case '=': speed = dmin(8.0, speed * 2); break;
+                case '-': case '_': speed = dmax(0.125, speed / 2); break;
+                case 'h': case 'H': help = !help; break;
+                case 'q': case 'Q': case 3: case 27: g_run = 0; break;
+                }
             }
-
-        } else if (fase == DRAIN) {
-            pacing_gain = 1.0 / 2.89;
-
-            /* la cola desaparece progresivamente */
-            acumulado_rtt *= 0.88;
-
-            if (tiempo_fase >= 2.0) {
-                fase = PROBE_BW;
-                tiempo_fase = 0.0;
-                ciclo_probe = 0;
-            }
-
-        } else if (fase == PROBE_BW) {
-            double gains[8] = {1.25, 0.75, 1, 1, 1, 1, 1, 1};
-            pacing_gain = gains[ciclo_probe];
-
-            /*
-             * Durante 1.25 BBR intenta encontrar mas BW.
-             * En esta simulacion, si la capacidad no cambio,
-             * BtlBw permanece cerca de la capacidad.
-             */
-            if (pacing_gain > 1.0) {
-                btlbw = min(capacidad_mbps,
-                            btlbw * 1.01);
-                acumulado_rtt += 0.25;
-            } else if (pacing_gain < 1.0) {
-                acumulado_rtt *= 0.92;
-            }
-
-            ciclo_probe++;
-            if (ciclo_probe >= 8) ciclo_probe = 0;
-
-            /*
-             * Cada 10 segundos se hace PROBE_RTT.
-             */
-            if (tiempo_fase >= 10.0) {
-                fase = PROBE_RTT;
-                tiempo_fase = 0.0;
-            }
-
-        } else if (fase == PROBE_RTT) {
-            pacing_gain = 1.0;
-
-            /* RTT minimo se vuelve a medir */
-            acumulado_rtt *= 0.75;
-            rtprop = rt_base_ms + acumulado_rtt;
-
-            if (tiempo_fase >= 0.2) {
-                fase = PROBE_BW;
-                tiempo_fase = 0.0;
-                ciclo_probe = 0;
-                acumulado_rtt = 0.0;
-            }
+        } else {
+            /* escenario guionado para modo batch */
+            double ts = s.t / 1000.0;
+            static int ev = 0;
+            if (ev == 0 && ts >= 15) { set_bw(&s, s.link.bw_mbps / 2); ev = 1; }
+            if (ev == 1 && ts >= 30) { set_bw(&s, s.link.bw_mbps * 4); ev = 2; }
+            if (ev == 2 && ts >= 45) { set_rtt(&s, s.link.rtprop_ms + 40); ev = 3; }
         }
 
-        /*
-         * RTT observado:
-         * RTprop + componente de cola + efecto de perdida.
-         */
-        double cola_ms = max(0.0, acumulado_rtt);
-        double perdida_ms = perdida * 0.15;
-        double rtt = rtprop + cola_ms + perdida_ms;
+        /* ------------------------------------------------ avance del sim */
+        if (!paused) for (int i = 0; i < steps_per_frame; i++) sim_step(&s);
 
-        /*
-         * Tasa efectiva.
-         * Se limita por el enlace y se reduce ligeramente por perdida.
-         */
-        double tasa = btlbw * pacing_gain;
-        tasa = min(tasa, capacidad_mbps);
-        tasa *= (1.0 - perdida / 100.0);
+        /* ------------------------------------------------ historial      */
+        double bdp = s.btlbw * s.rtprop;
+        push(h.rate,     BPMS2MBPS(s.rate_sample));
+        push(h.btlbw,    BPMS2MBPS(s.btlbw));
+        push(h.pacing,   BPMS2MBPS(s.pacing));
+        push(h.rtt,      s.rtt_cur);
+        push(h.rtprop,   s.rtprop);
+        push(h.inflight, s.inflight / 1024.0);
+        push(h.bdp,      bdp / 1024.0);
+        push(h.cwnd,     s.cwnd / 1024.0);
+        push(h.qdelay,   s.qdelay);
+        push(h.phase,    (double)s.st);
 
-        /*
-         * BDP = BtlBw * RTprop
-         * Mbps * ms -> Mbit*ms -> bytes
-         */
-        double bdp_bytes =
-            (btlbw * 1000000.0) * (rtprop / 1000.0) / 8.0;
+        if (csv)
+            fprintf(csv, "%.3f,%s,%.3f,%.1f,%.4f,%.4f,%.3f,%.3f,%.2f,%.2f,%.2f,%.3f,%.2f,%ld\n",
+                    s.t / 1000.0, ST_NAME[s.st], s.link.bw_mbps, s.link.rtprop_ms,
+                    BPMS2MBPS(s.rate_sample), BPMS2MBPS(s.btlbw), s.rtt_cur, s.rtprop,
+                    bdp / 1024.0, s.inflight / 1024.0, s.cwnd / 1024.0, s.qdelay,
+                    s.pacing_gain, s.drops_buf + s.drops_rand);
 
-        double cwnd = bdp_bytes * 2.0; /* cwnd_gain didactico */
-
-        if (n < MAX_MUESTRAS) {
-            muestras[n].tiempo = t;
-            muestras[n].btlbw_mbps = btlbw;
-            muestras[n].rtprop_ms = rtprop;
-            muestras[n].rtt_ms = rtt;
-            muestras[n].tasa_mbps = tasa;
-            muestras[n].cwnd_bytes = cwnd;
-            muestras[n].fase = fase;
-            n++;
+        /* ------------------------------------------------ salida         */
+        if (interactive) {
+            render(&s, &h, paused, speed, help);
+            double wall_ms = RENDER_MS / speed;
+            struct timespec ts2 = { (time_t)(wall_ms / 1000.0),
+                                    (long)((wall_ms - floor(wall_ms / 1000.0) * 1000.0) * 1e6) };
+            nanosleep(&ts2, NULL);
+        } else {
+            if (s.t >= next_frame) {
+                printf("t=%6.2fs  %-9s  bw_real=%7.2f  tasa=%7.2f Mbps  BtlBw=%7.2f  "
+                       "RTT=%6.1f  RTprop=%6.1f  BDP=%6.1fKB  cola=%5.1fms\n",
+                       s.t / 1000.0, ST_NAME[s.st], s.link.bw_mbps,
+                       BPMS2MBPS(s.rate_sample), BPMS2MBPS(s.btlbw),
+                       s.rtt_cur, s.rtprop, bdp / 1024.0, s.qdelay);
+                next_frame += 1000.0;
+            }
+            if (s.t >= dur * 1000.0) g_run = 0;
         }
-
-        tiempo_fase += intervalo_ms / 1000.0;
+        (void)t0;
     }
 
-    FILE *csv = fopen("bbr_datos.csv", "w");
-    if (!csv) {
-        perror("No se pudo crear bbr_datos.csv");
-        return 1;
-    }
+    if (csv) fclose(csv);
+    if (interactive) { term_restore(); g_raw = 0; }
 
-    fprintf(csv,
-        "tiempo_s,BtlBw_Mbps,RTprop_ms,RTT_ms,"
-        "tasa_Mbps,cwnd_bytes,fase\n");
-
-    for (int i = 0; i < n; i++) {
-        fprintf(csv, "%.2f,%.4f,%.4f,%.4f,%.4f,%.2f,%s\n",
-                muestras[i].tiempo,
-                muestras[i].btlbw_mbps,
-                muestras[i].rtprop_ms,
-                muestras[i].rtt_ms,
-                muestras[i].tasa_mbps,
-                muestras[i].cwnd_bytes,
-                nombre_fase(muestras[i].fase));
-    }
-
-    fclose(csv);
-
-    printf("\n=========================================\n");
-    printf("           RESULTADO FINAL\n");
-    printf("=========================================\n");
-
-    Muestra *ult = &muestras[n - 1];
-
-    printf("BtlBw       : %.2f Mbps\n", ult->btlbw_mbps);
-    printf("RTprop      : %.2f ms\n", ult->rtprop_ms);
-    printf("RTT         : %.2f ms\n", ult->rtt_ms);
-    printf("Tasa        : %.2f Mbps\n", ult->tasa_mbps);
-    printf("CWND        : %.2f bytes\n", ult->cwnd_bytes);
-    printf("Fase        : %s\n", nombre_fase(ult->fase));
-
-    printf("\nDatos guardados en: bbr_datos.csv\n");
-
-    printf("\n-----------------------------------------\n");
-    printf("Formula BDP:\n");
-    printf("BDP = BtlBw * RTprop\n");
-    printf("-----------------------------------------\n");
-
-    /*
-     * Grafico ASCII sencillo de BtlBw.
-     */
-    printf("\nGRAFICA ASCII - BtlBw\n");
-    printf("(cada # representa aproximadamente 5%% del enlace)\n\n");
-
-    for (int i = 0; i < n; i += max(1, n / 30)) {
-        int barras = (int)round(
-            (muestras[i].btlbw_mbps / capacidad_mbps) * 20.0
-        );
-
-        if (barras > 20) barras = 20;
-
-        printf("%5.1fs | ", muestras[i].tiempo);
-        for (int j = 0; j < barras; j++)
-            printf("#");
-        printf(" %.2f Mbps [%s]\n",
-               muestras[i].btlbw_mbps,
-               nombre_fase(muestras[i].fase));
-    }
-
-    printf("\nGRAFICA ASCII - RTprop\n\n");
-
-    double max_rt = rt_base_ms * 2.0;
-    for (int i = 0; i < n; i += max(1, n / 30)) {
-        int barras = (int)round(
-            (muestras[i].rtprop_ms / max_rt) * 20.0
-        );
-
-        if (barras > 20) barras = 20;
-
-        printf("%5.1fs | ", muestras[i].tiempo);
-        for (int j = 0; j < barras; j++)
-            printf("#");
-        printf(" %.2f ms\n", muestras[i].rtprop_ms);
-    }
-
-    printf("\n=========================================\n");
-    printf("FIN DE LA SIMULACION\n");
-    printf("=========================================\n");
-
+    printf("\nResumen: %.2f s simulados | entregado %.2f MB | media %.2f Mbps | "
+           "perdidas %ld (cola %ld, azar %ld)\n",
+           s.t / 1000.0, s.delivered_bytes / 1e6,
+           s.t > 0 ? BPMS2MBPS(s.delivered_bytes / s.t) : 0.0,
+           s.drops_buf + s.drops_rand, s.drops_buf, s.drops_rand);
+    if (csvpath) printf("CSV escrito en: %s\n", csvpath);
     return 0;
 }
