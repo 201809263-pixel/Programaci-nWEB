@@ -1,1 +1,317 @@
+/*
+ * simulador_bbr.c
+ * Simulador didactico de BBR (modelo simplificado inspirado en BBRv1).
+ *
+ * Compilar:
+ *   gcc simulador_bbr.c -o simulador_bbr -lm
+ *
+ * Ejecutar:
+ *   ./simulador_bbr
+ *
+ * Genera:
+ *   bbr_datos.csv
+ *
+ * Para graficar los resultados se puede abrir el CSV en Excel/LibreOffice.
+ * Tambien se puede usar gnuplot:
+ *   plot "bbr_datos.csv" using 1:2 with lines title "BtlBw"
+ *   plot "bbr_datos.csv" using 1:3 with lines title "RTprop"
+ */
 
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+
+#define MAX_MUESTRAS 1000
+
+typedef enum {
+    STARTUP,
+    DRAIN,
+    PROBE_BW,
+    PROBE_RTT
+} Fase;
+
+typedef struct {
+    double tiempo;
+    double btlbw_mbps;
+    double rtprop_ms;
+    double rtt_ms;
+    double tasa_mbps;
+    double cwnd_bytes;
+    Fase fase;
+} Muestra;
+
+const char *nombre_fase(Fase f) {
+    switch (f) {
+        case STARTUP:   return "STARTUP";
+        case DRAIN:     return "DRAIN";
+        case PROBE_BW:  return "PROBE_BW";
+        case PROBE_RTT: return "PROBE_RTT";
+        default:        return "DESCONOCIDA";
+    }
+}
+
+double min(double a, double b) { return a < b ? a : b; }
+double max(double a, double b) { return a > b ? a : b; }
+
+int main(void) {
+    double capacidad_mbps, rt_base_ms, perdida, mss;
+    int duracion, intervalo_ms;
+
+    printf("=========================================\n");
+    printf("       SIMULADOR DIDACTICO DE BBR\n");
+    printf("=========================================\n\n");
+
+    printf("Ancho de banda del enlace (Mbps) [1-100]: ");
+    scanf("%lf", &capacidad_mbps);
+
+    printf("RTT/base de propagacion (ms) [1-500]: ");
+    scanf("%lf", &rt_base_ms);
+
+    printf("Perdida de paquetes (%%) [0-20]: ");
+    scanf("%lf", &perdida);
+
+    printf("MSS en bytes [500-9000]: ");
+    scanf("%lf", &mss);
+
+    printf("Duracion de simulacion (segundos) [10-60]: ");
+    scanf("%d", &duracion);
+
+    printf("Intervalo de muestreo (ms) [100-1000]: ");
+    scanf("%d", &intervalo_ms);
+
+    if (capacidad_mbps < 1) capacidad_mbps = 1;
+    if (capacidad_mbps > 100) capacidad_mbps = 100;
+    if (rt_base_ms < 1) rt_base_ms = 1;
+    if (rt_base_ms > 500) rt_base_ms = 500;
+    if (perdida < 0) perdida = 0;
+    if (perdida > 20) perdida = 20;
+    if (mss < 500) mss = 500;
+    if (mss > 9000) mss = 9000;
+    if (duracion < 10) duracion = 10;
+    if (duracion > 60) duracion = 60;
+    if (intervalo_ms < 100) intervalo_ms = 100;
+    if (intervalo_ms > 1000) intervalo_ms = 1000;
+
+    Muestra muestras[MAX_MUESTRAS];
+    int n = 0;
+
+    double btlbw = capacidad_mbps * 0.10;
+    double rtprop = rt_base_ms * 1.20;
+    double pacing_gain = 2.89;
+    Fase fase = STARTUP;
+
+    int pasos = (duracion * 1000) / intervalo_ms;
+    if (pasos > MAX_MUESTRAS) pasos = MAX_MUESTRAS;
+
+    double tiempo_fase = 0.0;
+    int ciclo_probe = 0;
+    double acumulado_rtt = rt_base_ms * 0.20;
+
+    printf("\nSimulando...\n\n");
+
+    for (int i = 0; i < pasos; i++) {
+        double t = (i * intervalo_ms) / 1000.0;
+
+        /*
+         * Modelo de red didactico:
+         * - STARTUP descubre progresivamente el BtlBw.
+         * - DRAIN reduce la tasa para vaciar la cola.
+         * - PROBE_BW utiliza el ciclo 1.25/0.75/1...
+         * - PROBE_RTT reduce temporalmente el in-flight y actualiza RTprop.
+         */
+
+        if (fase == STARTUP) {
+            pacing_gain = 2.89;
+
+            /* crecimiento exponencial limitado por la capacidad */
+            btlbw = min(capacidad_mbps,
+                        btlbw * 1.35);
+
+            acumulado_rtt += (btlbw / capacidad_mbps) * 0.4;
+
+            if (btlbw >= capacidad_mbps * 0.90 || tiempo_fase >= 4.0) {
+                fase = DRAIN;
+                tiempo_fase = 0.0;
+            }
+
+        } else if (fase == DRAIN) {
+            pacing_gain = 1.0 / 2.89;
+
+            /* la cola desaparece progresivamente */
+            acumulado_rtt *= 0.88;
+
+            if (tiempo_fase >= 2.0) {
+                fase = PROBE_BW;
+                tiempo_fase = 0.0;
+                ciclo_probe = 0;
+            }
+
+        } else if (fase == PROBE_BW) {
+            double gains[8] = {1.25, 0.75, 1, 1, 1, 1, 1, 1};
+            pacing_gain = gains[ciclo_probe];
+
+            /*
+             * Durante 1.25 BBR intenta encontrar mas BW.
+             * En esta simulacion, si la capacidad no cambio,
+             * BtlBw permanece cerca de la capacidad.
+             */
+            if (pacing_gain > 1.0) {
+                btlbw = min(capacidad_mbps,
+                            btlbw * 1.01);
+                acumulado_rtt += 0.25;
+            } else if (pacing_gain < 1.0) {
+                acumulado_rtt *= 0.92;
+            }
+
+            ciclo_probe++;
+            if (ciclo_probe >= 8) ciclo_probe = 0;
+
+            /*
+             * Cada 10 segundos se hace PROBE_RTT.
+             */
+            if (tiempo_fase >= 10.0) {
+                fase = PROBE_RTT;
+                tiempo_fase = 0.0;
+            }
+
+        } else if (fase == PROBE_RTT) {
+            pacing_gain = 1.0;
+
+            /* RTT minimo se vuelve a medir */
+            acumulado_rtt *= 0.75;
+            rtprop = rt_base_ms + acumulado_rtt;
+
+            if (tiempo_fase >= 0.2) {
+                fase = PROBE_BW;
+                tiempo_fase = 0.0;
+                ciclo_probe = 0;
+                acumulado_rtt = 0.0;
+            }
+        }
+
+        /*
+         * RTT observado:
+         * RTprop + componente de cola + efecto de perdida.
+         */
+        double cola_ms = max(0.0, acumulado_rtt);
+        double perdida_ms = perdida * 0.15;
+        double rtt = rtprop + cola_ms + perdida_ms;
+
+        /*
+         * Tasa efectiva.
+         * Se limita por el enlace y se reduce ligeramente por perdida.
+         */
+        double tasa = btlbw * pacing_gain;
+        tasa = min(tasa, capacidad_mbps);
+        tasa *= (1.0 - perdida / 100.0);
+
+        /*
+         * BDP = BtlBw * RTprop
+         * Mbps * ms -> Mbit*ms -> bytes
+         */
+        double bdp_bytes =
+            (btlbw * 1000000.0) * (rtprop / 1000.0) / 8.0;
+
+        double cwnd = bdp_bytes * 2.0; /* cwnd_gain didactico */
+
+        if (n < MAX_MUESTRAS) {
+            muestras[n].tiempo = t;
+            muestras[n].btlbw_mbps = btlbw;
+            muestras[n].rtprop_ms = rtprop;
+            muestras[n].rtt_ms = rtt;
+            muestras[n].tasa_mbps = tasa;
+            muestras[n].cwnd_bytes = cwnd;
+            muestras[n].fase = fase;
+            n++;
+        }
+
+        tiempo_fase += intervalo_ms / 1000.0;
+    }
+
+    FILE *csv = fopen("bbr_datos.csv", "w");
+    if (!csv) {
+        perror("No se pudo crear bbr_datos.csv");
+        return 1;
+    }
+
+    fprintf(csv,
+        "tiempo_s,BtlBw_Mbps,RTprop_ms,RTT_ms,"
+        "tasa_Mbps,cwnd_bytes,fase\n");
+
+    for (int i = 0; i < n; i++) {
+        fprintf(csv, "%.2f,%.4f,%.4f,%.4f,%.4f,%.2f,%s\n",
+                muestras[i].tiempo,
+                muestras[i].btlbw_mbps,
+                muestras[i].rtprop_ms,
+                muestras[i].rtt_ms,
+                muestras[i].tasa_mbps,
+                muestras[i].cwnd_bytes,
+                nombre_fase(muestras[i].fase));
+    }
+
+    fclose(csv);
+
+    printf("\n=========================================\n");
+    printf("           RESULTADO FINAL\n");
+    printf("=========================================\n");
+
+    Muestra *ult = &muestras[n - 1];
+
+    printf("BtlBw       : %.2f Mbps\n", ult->btlbw_mbps);
+    printf("RTprop      : %.2f ms\n", ult->rtprop_ms);
+    printf("RTT         : %.2f ms\n", ult->rtt_ms);
+    printf("Tasa        : %.2f Mbps\n", ult->tasa_mbps);
+    printf("CWND        : %.2f bytes\n", ult->cwnd_bytes);
+    printf("Fase        : %s\n", nombre_fase(ult->fase));
+
+    printf("\nDatos guardados en: bbr_datos.csv\n");
+
+    printf("\n-----------------------------------------\n");
+    printf("Formula BDP:\n");
+    printf("BDP = BtlBw * RTprop\n");
+    printf("-----------------------------------------\n");
+
+    /*
+     * Grafico ASCII sencillo de BtlBw.
+     */
+    printf("\nGRAFICA ASCII - BtlBw\n");
+    printf("(cada # representa aproximadamente 5%% del enlace)\n\n");
+
+    for (int i = 0; i < n; i += max(1, n / 30)) {
+        int barras = (int)round(
+            (muestras[i].btlbw_mbps / capacidad_mbps) * 20.0
+        );
+
+        if (barras > 20) barras = 20;
+
+        printf("%5.1fs | ", muestras[i].tiempo);
+        for (int j = 0; j < barras; j++)
+            printf("#");
+        printf(" %.2f Mbps [%s]\n",
+               muestras[i].btlbw_mbps,
+               nombre_fase(muestras[i].fase));
+    }
+
+    printf("\nGRAFICA ASCII - RTprop\n\n");
+
+    double max_rt = rt_base_ms * 2.0;
+    for (int i = 0; i < n; i += max(1, n / 30)) {
+        int barras = (int)round(
+            (muestras[i].rtprop_ms / max_rt) * 20.0
+        );
+
+        if (barras > 20) barras = 20;
+
+        printf("%5.1fs | ", muestras[i].tiempo);
+        for (int j = 0; j < barras; j++)
+            printf("#");
+        printf(" %.2f ms\n", muestras[i].rtprop_ms);
+    }
+
+    printf("\n=========================================\n");
+    printf("FIN DE LA SIMULACION\n");
+    printf("=========================================\n");
+
+    return 0;
+}
